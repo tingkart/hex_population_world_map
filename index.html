@@ -1,0 +1,1266 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Norway Population Density</title>
+    <script src="https://unpkg.com/h3-js@^4.0.0"></script>
+    <script src="https://unpkg.com/deck.gl@latest/dist.min.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: 'Inter', sans-serif;
+            background: #000;
+        }
+
+        #container {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #tooltip {
+            position: absolute;
+            z-index: 100;
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.8);
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            display: none;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        .header-container {
+            position: absolute;
+            top: 30px;
+            left: 30px;
+            z-index: 1;
+            width: 360px;
+            /* Slightly narrower */
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+
+            /* Glassmorphism Box */
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(10px);
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.5);
+        }
+
+        .title-container {
+            margin: 0;
+            pointer-events: auto;
+        }
+
+        .title-small {
+            margin: 0;
+            font-size: 12px;
+            font-weight: 400;
+            letter-spacing: 2px;
+            color: rgba(8, 48, 107, 0.6);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 48px;
+            font-weight: 700;
+            letter-spacing: -1px;
+            color: #1a1a1a;
+            line-height: 1;
+            text-transform: uppercase;
+        }
+
+        p.subtitle {
+            margin: 0;
+            color: #08306B;
+            font-size: 14px;
+            line-height: 1.5;
+            pointer-events: auto;
+            margin-top: 12px;
+            /* text-shadow removed */
+        }
+
+        .source-link {
+            font-size: 10px;
+            color: #08306B;
+            text-decoration: none;
+            opacity: 0.7;
+            transition: opacity 0.2s, color 0.3s;
+            pointer-events: auto;
+            align-self: flex-start;
+            /* Don't stretch */
+        }
+
+        .source-link:hover {
+            opacity: 1;
+            text-decoration: underline;
+        }
+
+        /* Transition for text colors */
+        h1,
+        .title-small,
+        p.subtitle {
+            transition: color 0.3s;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="container"></div>
+    <div id="tooltip"></div>
+
+    <div class="header-container">
+        <div class="title-container">
+            <p class="title-small">Population Density Map</p>
+            <h1>Norway</h1>
+        </div>
+        <p class="subtitle">
+            Population clusters rise sharply around Norway's urban corridors, while vast stretches of land remain
+            sparsely
+            inhabited.
+            Each spike reflects density within a 400-meter hexagon.
+        </p>
+        <a href="https://data.humdata.org/dataset/kontur-population-dataset" target="_blank" class="source-link">Data
+            Source: Kontur Population 20231101</a>
+    </div>
+
+    <script>
+        const { DeckGL, H3HexagonLayer, PolygonLayer, AmbientLight, DirectionalLight, LightingEffect, FlyToInterpolator, WebMercatorViewport } = deck;
+
+        // Nordic Blue Palette (Light -> Dark)
+        const NORDIC_BLUE_RANGE = [
+            [247, 251, 255], // Very light icy blue
+            [222, 235, 247],
+            [198, 219, 239],
+            [158, 202, 225],
+            [107, 174, 214],
+            [66, 146, 198],
+            [33, 113, 181],
+            [8, 81, 156],
+            [8, 48, 107]     // Deep midnight blue
+        ];
+
+        const ambientLight = new AmbientLight({
+            color: [255, 255, 255],
+            intensity: 0.5 // Reduced from 1.0 to make shadows more visible
+        });
+
+        let directionalLight = new DirectionalLight({
+            color: [255, 255, 255],
+            intensity: 1.0,
+            direction: [1, 0, -1], // Pointing East (from West)
+            _shadow: true
+        });
+
+        const lightingEffect = new LightingEffect({ ambientLight, directionalLight });
+
+        let currentViewState = {
+            longitude: 15,
+            latitude: 65,
+            zoom: 4,
+            pitch: 45,
+            bearing: 0
+        };
+
+        let viewMaxVal = 1; // Dynamic max based on view
+        let globalMaxVal = 1; // Global max of the dataset
+        let debounceTimer;
+        let useShadows = true;
+
+        const deckgl = new DeckGL({
+            container: 'container',
+            mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json', // Clean background
+            initialViewState: currentViewState,
+            glOptions: {
+                preserveDrawingBuffer: true
+            },
+            mapOptions: {
+                preserveDrawingBuffer: true
+            },
+            controller: true,
+            // useDevicePixels: false, // Reverted: User found it messy
+            effects: [lightingEffect],
+            layers: [],
+            onViewStateChange: ({ viewState }) => {
+                currentViewState = viewState;
+                // Debounce the update to avoid performance hit
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(updateVisibleMax, 500);
+                return viewState;
+            }
+        });
+
+        // UI Styles
+        const style = document.createElement('style');
+        style.textContent = `
+            .ui-container {
+                position: absolute;
+                top: 24px;
+                right: 24px;
+                z-index: 10;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                min-width: 200px;
+            }
+            .country-select {
+                padding: 12px 16px;
+                font-size: 15px;
+                font-weight: 500;
+                border-radius: 10px;
+                border: 1px solid rgba(0, 0, 0, 0.08);
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(20px) saturate(180%);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.06);
+                cursor: pointer;
+                outline: none;
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+                color: #1a1a1a;
+                appearance: none;
+                -webkit-appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='%231a1a1a' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 12px center;
+                padding-right: 36px;
+            }
+            .country-select:hover {
+                background: rgba(255, 255, 255, 1);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.06);
+                border-color: rgba(0, 0, 0, 0.12);
+                transform: translateY(-1px);
+            }
+            .country-select:active {
+                transform: translateY(0);
+                box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+            }
+            .settings-btn {
+                padding: 11px 16px;
+                font-size: 14px;
+                font-weight: 500;
+                border-radius: 10px;
+                border: 1px solid rgba(0, 0, 0, 0.08);
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(20px) saturate(180%);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.06);
+                cursor: pointer;
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                color: #1a1a1a;
+                letter-spacing: -0.01em;
+            }
+            .settings-btn:hover {
+                background: rgba(255, 255, 255, 1);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.06);
+                border-color: rgba(0, 0, 0, 0.12);
+            }
+            .settings-btn:active {
+                transform: translateY(0);
+                box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+            }
+            .settings-btn svg {
+                transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            .settings-btn:hover svg {
+                transform: rotate(15deg);
+            }
+            .settings-panel {
+                display: none;
+                background: rgba(255, 255, 255, 0.98);
+                backdrop-filter: blur(20px) saturate(180%);
+                padding: 20px;
+                border-radius: 12px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.08), 0 2px 8px rgba(0,0,0,0.04);
+                width: 280px;
+                border: 1px solid rgba(0, 0, 0, 0.08);
+                animation: fadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            @keyframes fadeIn {
+                from { 
+                    opacity: 0; 
+                    transform: translateY(-8px) scale(0.96); 
+                }
+                to { 
+                    opacity: 1; 
+                    transform: translateY(0) scale(1); 
+                }
+            }
+            .setting-group {
+                margin-bottom: 18px;
+            }
+            .setting-group:last-child {
+                margin-bottom: 0;
+            }
+            .setting-label {
+                display: block;
+                margin-bottom: 10px;
+                font-weight: 600;
+                font-size: 11px;
+                color: #666;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+            }
+            .setting-input {
+                width: 100%;
+                padding: 10px 12px;
+                border-radius: 8px;
+                border: 1px solid rgba(0, 0, 0, 0.1);
+                background: white;
+                font-size: 14px;
+                font-weight: 500;
+                transition: all 0.2s ease;
+                color: #1a1a1a;
+            }
+            .setting-input:hover {
+                border-color: rgba(0, 0, 0, 0.2);
+            }
+            .setting-input:focus {
+                outline: none;
+                border-color: #08306B;
+                box-shadow: 0 0 0 3px rgba(8, 48, 107, 0.1);
+            }
+            .color-picker-container {
+                display: flex;
+                gap: 10px;
+            }
+            .color-input {
+                flex: 1;
+                height: 36px;
+                padding: 0;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+            }
+            input[type=range] {
+                width: 100%;
+                cursor: pointer;
+                height: 6px;
+                -webkit-appearance: none;
+                appearance: none;
+                background: linear-gradient(to right, #08306B 0%, #08306B var(--value, 50%), #e0e0e0 var(--value, 50%), #e0e0e0 100%);
+                border-radius: 3px;
+                outline: none;
+            }
+            input[type=range]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: white;
+                border: 2px solid #08306B;
+                cursor: pointer;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                transition: all 0.2s ease;
+            }
+            input[type=range]::-webkit-slider-thumb:hover {
+                transform: scale(1.1);
+                box-shadow: 0 3px 8px rgba(0,0,0,0.15);
+            }
+            input[type=range]::-moz-range-thumb {
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: white;
+                border: 2px solid #08306B;
+                cursor: pointer;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                transition: all 0.2s ease;
+            }
+            input[type=range]::-moz-range-thumb:hover {
+                transform: scale(1.1);
+                box-shadow: 0 3px 8px rgba(0,0,0,0.15);
+            }
+            .loading-spinner {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 20;
+                display: none;
+            }
+            .spinner {
+                width: 50px;
+                height: 50px;
+                border: 5px solid rgba(255, 255, 255, 0.3);
+                border-radius: 50%;
+                border-top-color: #08306B;
+                animation: spin 1s ease-in-out infinite;
+            }
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+            .legend-bar {
+                width: 200px;
+                height: 12px;
+                border-radius: 6px;
+                background: linear-gradient(to right, #ccc, #333);
+                margin-bottom: 5px;
+                border: 1px solid rgba(0,0,0,0.1);
+            }
+            .legend-labels {
+                display: flex;
+                justify-content: space-between;
+                font-size: 10px;
+                color: #666;
+                font-weight: 600;
+            }
+        `;
+        document.head.appendChild(style);
+
+        // Loading Spinner
+        const spinnerContainer = document.createElement('div');
+        spinnerContainer.className = 'loading-spinner';
+        spinnerContainer.innerHTML = '<div class="spinner"></div>';
+        document.body.appendChild(spinnerContainer);
+
+
+        // UI Elements
+        const uiContainer = document.createElement('div');
+        uiContainer.className = 'ui-container';
+        document.body.appendChild(uiContainer);
+
+        // Legend
+        const legendContainer = document.createElement('div');
+        legendContainer.style.position = 'absolute';
+        legendContainer.style.bottom = '30px';
+        legendContainer.style.right = '30px';
+        legendContainer.style.padding = '15px';
+        legendContainer.style.background = 'rgba(255, 255, 255, 0.9)';
+        legendContainer.style.backdropFilter = 'blur(10px)';
+        legendContainer.style.borderRadius = '8px';
+        legendContainer.style.boxShadow = '0 4px 6px rgba(0,0,0,0.1)';
+        legendContainer.style.zIndex = '10';
+
+        const legendTitle = document.createElement('div');
+        legendTitle.innerText = 'POPULATION DENSITY';
+        legendTitle.style.fontSize = '10px';
+        legendTitle.style.fontWeight = 'bold';
+        legendTitle.style.marginBottom = '8px';
+        legendTitle.style.letterSpacing = '1px';
+        legendTitle.style.color = '#333';
+        legendContainer.appendChild(legendTitle);
+
+        const legendBar = document.createElement('div');
+        legendBar.className = 'legend-bar';
+        legendContainer.appendChild(legendBar);
+
+        const legendLabels = document.createElement('div');
+        legendLabels.className = 'legend-labels';
+        legendLabels.innerHTML = '<span>LOW</span><span>HIGH</span>';
+        legendContainer.appendChild(legendLabels);
+
+        document.body.appendChild(legendContainer);
+
+        // Country Select
+        const countrySelect = document.createElement('select');
+        countrySelect.className = 'country-select';
+        uiContainer.appendChild(countrySelect);
+
+        // Settings Toggle
+        const settingsBtn = document.createElement('button');
+        settingsBtn.className = 'settings-btn';
+        settingsBtn.innerHTML = `
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+            Settings
+        `;
+        settingsBtn.onclick = () => {
+            // Fix: Check computed style or explicit inline style to avoid double-click issue
+            const isHidden = window.getComputedStyle(settingsPanel).display === 'none';
+            settingsPanel.style.display = isHidden ? 'block' : 'none';
+        };
+        uiContainer.appendChild(settingsBtn);
+
+        // Export Button
+        const exportBtn = document.createElement('button');
+        exportBtn.className = 'settings-btn'; // Reuse style
+        exportBtn.innerHTML = `
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Snapshot
+        `;
+        exportBtn.onclick = () => {
+            // Hide UI elements that shouldn't be in screenshot if desired, 
+            // but user asked for "Current View" so we keep them.
+            uiContainer.style.display = 'none';
+
+            // Handle Base Map Visibility
+            const includeBaseMap = baseMapCheckbox.checked;
+            const currentMapStyle = deckgl.props.mapStyle;
+
+            if (!includeBaseMap) {
+                // Temporarily remove base map
+                deckgl.setProps({ mapStyle: null });
+            }
+
+            // Use html2canvas
+            // We need to load it first. Ideally via script tag in head, but we can inject it here if missing.
+            if (typeof html2canvas === 'undefined') {
+                const script = document.createElement('script');
+                script.src = 'https://html2canvas.hertzen.com/dist/html2canvas.min.js';
+                script.onload = takeScreenshot;
+                document.head.appendChild(script);
+            } else {
+                takeScreenshot();
+            }
+
+            function takeScreenshot() {
+                // Force a redraw to ensure fresh buffer
+                deckgl.redraw(true);
+
+                // Give it a moment to render
+                setTimeout(() => {
+                    // Capture the entire body
+                    // Since preserveDrawingBuffer is true, html2canvas should be able to read the WebGL canvas
+                    html2canvas(document.body, {
+                        backgroundColor: null, // Transparent background
+                        logging: false,
+                        useCORS: true, // Enable CORS for map tiles
+                        allowTaint: false,
+                        width: window.innerWidth,
+                        height: window.innerHeight,
+                        scale: window.devicePixelRatio
+                    }).then(canvas => {
+                        const link = document.createElement('a');
+                        link.download = `population-density-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.png`;
+                        link.href = canvas.toDataURL('image/png');
+                        link.click();
+
+                        uiContainer.style.display = 'flex';
+                        if (!includeBaseMap) {
+                            deckgl.setProps({ mapStyle: currentMapStyle });
+                        }
+                    }).catch(err => {
+                        console.error("Screenshot failed:", err);
+                        alert("Failed to take screenshot.");
+                        uiContainer.style.display = 'flex';
+                        if (!includeBaseMap) {
+                            deckgl.setProps({ mapStyle: currentMapStyle });
+                        }
+                    });
+                }, 500); // Wait 500ms for redraw
+            }
+        };
+        uiContainer.appendChild(exportBtn);
+
+        // Settings Panel
+        const settingsPanel = document.createElement('div');
+        settingsPanel.className = 'settings-panel';
+        // Explicitly set display to none to match logic
+        settingsPanel.style.display = 'none';
+        uiContainer.appendChild(settingsPanel);
+
+        // Helper to create setting inputs
+        function createSetting(label, input) {
+            const div = document.createElement('div');
+            div.className = 'setting-group';
+            const lbl = document.createElement('label');
+            lbl.className = 'setting-label';
+            lbl.innerText = label;
+            div.appendChild(lbl);
+            div.appendChild(input);
+            settingsPanel.appendChild(div);
+        }
+
+        // Export Options
+        const baseMapCheckbox = document.createElement('input');
+        baseMapCheckbox.type = 'checkbox';
+        baseMapCheckbox.checked = true;
+        baseMapCheckbox.style.marginRight = '8px';
+
+        const baseMapLabel = document.createElement('label');
+        baseMapLabel.style.fontSize = '14px';
+        baseMapLabel.style.display = 'flex';
+        baseMapLabel.style.alignItems = 'center';
+        baseMapLabel.appendChild(baseMapCheckbox);
+        baseMapLabel.appendChild(document.createTextNode('Include Base Map in Snapshot'));
+
+        const exportGroup = document.createElement('div');
+        exportGroup.className = 'setting-group';
+        exportGroup.appendChild(baseMapLabel);
+        settingsPanel.appendChild(exportGroup);
+
+        // Shadow Toggle
+        const shadowCheckbox = document.createElement('input');
+        shadowCheckbox.type = 'checkbox';
+        shadowCheckbox.checked = useShadows;
+        shadowCheckbox.style.marginRight = '8px';
+        // Global error handler
+        window.onerror = function (msg, url, line, col, error) {
+            console.error('Global Error:', { msg, url, line, col, error });
+            return false;
+        };
+
+        shadowCheckbox.onchange = (e) => {
+            useShadows = e.target.checked;
+            console.log('Shadow toggle changed:', useShadows);
+
+            // Recreate directional light with default values to ensure validity
+            // We use the current intensity if possible, or default to 1.0
+            const intensity = parseFloat(lightSlider.value) || 1.0;
+
+            // Use the default direction for now to avoid calculation errors
+            // [-1, -3, -1]
+            const direction = [1, 0, -1];
+
+            directionalLight = new DirectionalLight({
+                color: [255, 255, 255],
+                intensity: intensity,
+                direction: direction,
+                _shadow: useShadows
+            });
+
+            deckgl.setProps({ effects: [new LightingEffect({ ambientLight, directionalLight })] });
+
+            if (currentData) renderLayer(currentData);
+        };
+
+        const shadowLabel = document.createElement('label');
+        shadowLabel.style.fontSize = '14px';
+        shadowLabel.style.display = 'flex';
+        shadowLabel.style.alignItems = 'center';
+        //shadowLabel.appendChild(shadowCheckbox);
+        //shadowLabel.appendChild(document.createTextNode('Use Shadows'));
+
+        const shadowGroup = document.createElement('div');
+        shadowGroup.className = 'setting-group';
+        shadowGroup.appendChild(shadowLabel);
+        settingsPanel.appendChild(shadowGroup);
+
+
+
+        // Presets
+        const presets = {
+            'Emerald': { // New Reference Image Style
+                colors: [[200, 220, 200], [100, 200, 120], [5, 50, 40]], // Beige/Green -> Green -> Deep Teal
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.5,
+                elevation: 30000,
+                textColor: '#1b4d3e',
+                backgroundColor: '#ffffff'
+            },
+            'Magma': { // Previous Reference Image Style
+                colors: [[255, 160, 60], [200, 50, 80], [60, 20, 80]], // Orange -> Red -> Deep Purple
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.5,
+                elevation: 30000,
+                textColor: '#5D4037',
+                backgroundColor: '#ffffff'
+            },
+            'Nordic Blue': { // Default
+                colors: [[200, 230, 255], [10, 50, 120]], // Icy Blue -> Deep Blue
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.2,
+                elevation: 20000,
+                textColor: '#08306B',
+                backgroundColor: '#f7fbff' // Light Blue
+            },
+            'Golden Hour': {
+                colors: [[60, 20, 20], [255, 160, 60]], // Dark Brown -> Gold
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.5,
+                elevation: 30000,
+                textColor: '#5D4037', // Dark Brown
+                backgroundColor: '#fff8e1' // Warm White
+            },
+            'Cyberpunk': {
+                colors: [[45, 0, 75], [0, 255, 255]], // Deep Purple -> Cyan
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 2.0,
+                elevation: 40000,
+                textColor: '#00FFFF', // Cyan
+                backgroundColor: '#111111' // Dark
+            },
+            'Crimson': {
+                colors: [[50, 0, 0], [255, 50, 50]], // Dark Red -> Bright Red
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.5,
+                elevation: 25000,
+                textColor: '#FF5252', // Red Accent
+                backgroundColor: '#1a0505' // Dark Red
+            },
+            'Viridis': { // Perceptually uniform
+                colors: [[68, 1, 84], [253, 231, 37]], // Purple -> Yellow
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.3,
+                elevation: 25000,
+                textColor: '#FDE725', // Yellow
+                backgroundColor: '#111111' // Dark
+            },
+            'Inferno': { // High contrast
+                colors: [[0, 0, 4], [252, 253, 191]], // Black -> Pale Yellow
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.4,
+                elevation: 30000,
+                textColor: '#FCFDBF', // Pale Yellow
+                backgroundColor: '#000000' // Black
+            },
+            'Mint': { // Fresh/Light
+                colors: [[240, 255, 240], [0, 100, 50]], // Pale Green -> Dark Green
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.0,
+                elevation: 20000,
+                textColor: '#00695C', // Teal
+                backgroundColor: '#f0fff0' // Mint Cream
+            },
+            'Steel': { // Industrial
+                colors: [[230, 230, 235], [40, 50, 60]], // Light Grey -> Blue Grey
+                mapStyle: 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+                lighting: 1.1,
+                elevation: 20000,
+                textColor: '#37474F', // Blue Grey
+                backgroundColor: '#eceff1' // Blue Grey Light
+            },
+            'Sunset': { // Purple -> Orange
+                colors: [[45, 10, 60], [255, 100, 50]],
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.6,
+                elevation: 35000,
+                textColor: '#FFAB91', // Light Orange
+                backgroundColor: '#1a0510' // Dark Purple
+            },
+            'Ocean': { // Deep Teal -> Aqua
+                colors: [[0, 40, 50], [50, 220, 200]],
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.4,
+                elevation: 25000,
+                textColor: '#4DB6AC', // Teal
+                backgroundColor: '#001015' // Deep Teal
+            },
+            'Plasma': { // Blue -> Red -> Yellow
+                colors: [[13, 8, 135], [240, 249, 33]],
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+                lighting: 1.5,
+                elevation: 30000,
+                textColor: '#F0F921', // Yellow
+                backgroundColor: '#050015' // Dark Blue
+            }
+        };
+
+        const presetSelect = document.createElement('select');
+        presetSelect.className = 'setting-input';
+        Object.keys(presets).forEach(key => {
+            const opt = document.createElement('option');
+            opt.value = key;
+            opt.text = key;
+            presetSelect.add(opt);
+        });
+        presetSelect.onchange = (e) => applyPreset(e.target.value);
+        createSetting('Preset Theme', presetSelect);
+
+        // Map Style
+        const mapStyleSelect = document.createElement('select');
+        mapStyleSelect.className = 'setting-input';
+        const styles = {
+            'Light': 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json',
+            'Dark': 'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json',
+            'Voyager': 'https://basemaps.cartocdn.com/gl/voyager-nolabels-gl-style/style.json'
+        };
+        Object.keys(styles).forEach(key => {
+            const opt = document.createElement('option');
+            opt.value = styles[key];
+            opt.text = key;
+            mapStyleSelect.add(opt);
+        });
+        mapStyleSelect.onchange = (e) => {
+            deckgl.setProps({ mapStyle: e.target.value });
+        };
+        createSetting('Base Map', mapStyleSelect);
+
+        // Lighting Slider
+        const lightSlider = document.createElement('input');
+        lightSlider.type = 'range';
+        lightSlider.min = '0.5';
+        lightSlider.max = '3.0';
+        lightSlider.step = '0.1';
+        lightSlider.value = '1.0';
+        lightSlider.style.width = '100%';
+        lightSlider.oninput = (e) => {
+            const intensity = parseFloat(e.target.value);
+            directionalLight.intensity = intensity;
+            deckgl.setProps({ effects: [new LightingEffect({ ambientLight, directionalLight })] });
+        };
+        createSetting('Lighting Intensity', lightSlider);
+
+
+
+        // Light Direction (Azimuth)
+        const azimuthSlider = document.createElement('input');
+        azimuthSlider.type = 'range';
+        azimuthSlider.min = '0';
+        azimuthSlider.max = '360';
+        azimuthSlider.step = '1';
+        azimuthSlider.value = '270'; // Default West sun -> East shadow
+        azimuthSlider.style.width = '100%';
+
+        // Light Direction (Altitude/Pitch)
+        const altitudeSlider = document.createElement('input');
+        altitudeSlider.type = 'range';
+        altitudeSlider.min = '10';
+        altitudeSlider.max = '90';
+        altitudeSlider.step = '1';
+        altitudeSlider.value = '45';
+        altitudeSlider.style.width = '100%';
+
+        function updateLightDirection() {
+            const az = parseFloat(azimuthSlider.value) * (Math.PI / 180);
+            const alt = parseFloat(altitudeSlider.value) * (Math.PI / 180);
+
+            // Convert Az/Alt to X, Y, Z
+            // Z is up (sin(alt))
+            // X, Y are on plane
+            const z = -Math.sin(alt); // Light points down
+            const hyp = Math.cos(alt);
+            const x = -hyp * Math.sin(az); // Pointing opposite to source
+            const y = -hyp * Math.cos(az);
+
+            directionalLight = new DirectionalLight({
+                color: [255, 255, 255],
+                intensity: directionalLight.intensity,
+                direction: [x, y, z],
+                _shadow: useShadows
+            });
+            deckgl.setProps({ effects: [new LightingEffect({ ambientLight, directionalLight })] });
+        }
+
+        azimuthSlider.oninput = updateLightDirection;
+        altitudeSlider.oninput = updateLightDirection;
+
+        createSetting('Light Direction (Angle)', azimuthSlider);
+        createSetting('Light Height', altitudeSlider);
+
+        // Height Scale Slider
+        const heightSlider = document.createElement('input');
+        heightSlider.type = 'range';
+        heightSlider.min = '1000';
+        heightSlider.max = '100000';
+        heightSlider.step = '1000';
+        heightSlider.value = '20000'; // Default elevation scale
+        heightSlider.style.width = '100%';
+        heightSlider.oninput = (e) => {
+            const scale = parseFloat(e.target.value);
+            // Update the layer's elevationScale prop directly
+            // Find layer by ID as index might change with ground plane
+            const layers = deckgl.props.layers;
+            const layerIndex = layers.findIndex(l => l.id === 'h3-hexagon-layer');
+
+            if (layerIndex >= 0) {
+                const newLayers = [...layers];
+                newLayers[layerIndex] = layers[layerIndex].clone({ elevationScale: scale });
+                deckgl.setProps({ layers: newLayers });
+            }
+        };
+        createSetting('Height Scale', heightSlider);
+
+        // Color Pickers
+        let currentColors = presets['Nordic Blue'].colors;
+        let currentBackgroundColor = [247, 251, 255]; // Default RGB for Nordic Blue background
+
+        function hexToRgb(hex) {
+            const bigint = parseInt(hex.slice(1), 16);
+            return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
+        }
+
+        function rgbToHex(r, g, b) {
+            return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+        }
+
+        function updateLegend() {
+            const stops = currentColors.map(c => rgbToHex(...c)).join(', ');
+            legendBar.style.background = `linear-gradient(to right, ${stops})`;
+        }
+        // Initialize legend
+        updateLegend();
+
+        const colorContainer = document.createElement('div');
+        colorContainer.className = 'color-picker-container';
+
+        const colorStart = document.createElement('input');
+        colorStart.type = 'color';
+        colorStart.className = 'color-input';
+        colorStart.value = rgbToHex(...currentColors[0]);
+
+        const colorEnd = document.createElement('input');
+        colorEnd.type = 'color';
+        colorEnd.className = 'color-input';
+        colorEnd.value = rgbToHex(...currentColors[1]);
+
+        [colorStart, colorEnd].forEach(input => {
+            input.onchange = () => {
+                currentColors = [hexToRgb(colorStart.value), hexToRgb(colorEnd.value)];
+                updateLegend();
+                // Re-render current layer with new colors
+                if (currentData) renderLayer(currentData);
+            };
+            colorContainer.appendChild(input);
+        });
+        createSetting('Gradient (Low -> High)', colorContainer);
+
+        let currentData = []; // Store data for re-rendering
+        let currentCountry = null;
+
+        function applyPreset(name) {
+            const p = presets[name];
+            currentColors = p.colors;
+            colorStart.value = rgbToHex(...p.colors[0]);
+            colorEnd.value = rgbToHex(...p.colors[1]);
+            updateLegend();
+
+            deckgl.setProps({ mapStyle: p.mapStyle });
+            // Update map style dropdown if it matches
+            for (let opt of mapStyleSelect.options) {
+                if (opt.value === p.mapStyle) opt.selected = true;
+            }
+
+            directionalLight.intensity = p.lighting;
+            lightSlider.value = p.lighting;
+
+            // Update Elevation
+            if (p.elevation) {
+                heightSlider.value = p.elevation;
+                // We need to update the layer prop if it exists, similar to the slider handler
+                const layers = deckgl.props.layers;
+                const layerIndex = layers.findIndex(l => l.id === 'h3-hexagon-layer');
+
+                if (layerIndex >= 0) {
+                    const newLayers = [...layers];
+                    newLayers[layerIndex] = layers[layerIndex].clone({ elevationScale: p.elevation });
+                    deckgl.setProps({ layers: newLayers });
+                }
+            }
+
+            // Update Text Colors
+            if (p.textColor) {
+                document.querySelector('h1').style.color = p.textColor;
+                document.querySelector('.title-small').style.color = `${p.textColor}99`; // 60% opacity
+                document.querySelector('.subtitle').style.color = p.textColor;
+                document.querySelector('.source-link').style.color = p.textColor;
+            }
+
+            // Update Background Color (for export consistency)
+            if (p.backgroundColor) {
+                document.body.style.backgroundColor = p.backgroundColor;
+                currentBackgroundColor = hexToRgb(p.backgroundColor);
+            }
+
+            deckgl.setProps({ effects: [new LightingEffect({ ambientLight, directionalLight })] });
+
+            if (currentData) renderLayer(currentData);
+        }
+
+        // Initialize with default preset to ensure background color is set
+        applyPreset('Emerald');
+
+        let countries = [];
+
+        // Load countries index
+        fetch('public/countries.json')
+            .then(response => response.json())
+            .then(data => {
+                countries = data.sort((a, b) => a.name.localeCompare(b.name));
+
+                // Add default option
+                const defaultOption = document.createElement('option');
+                defaultOption.text = "Select a country...";
+                defaultOption.disabled = true;
+
+                countrySelect.add(defaultOption);
+
+                countries.forEach(country => {
+                    const option = document.createElement('option');
+                    option.value = country.code;
+                    option.text = country.name;
+                    countrySelect.add(option);
+                });
+
+                // Default to Norway if available
+                const norway = countries.find(c => c.name === 'Norway');
+                if (norway) {
+                    countrySelect.value = norway.code;
+                    loadCountry(norway.code);
+                }
+            })
+            .catch(err => console.error("Failed to load countries:", err));
+
+        countrySelect.addEventListener('change', (e) => {
+            const code = e.target.value;
+            if (code) loadCountry(code);
+        });
+
+        function updateVisibleMax() {
+            if (!currentData || currentData.length === 0) return;
+
+            const viewport = new WebMercatorViewport(currentViewState);
+            const bounds = viewport.getBounds(); // [minLon, minLat, maxLon, maxLat]
+            const [minLon, minLat, maxLon, maxLat] = bounds;
+
+            let max = 0;
+            let hasVisible = false;
+
+            // Check each point for visibility
+            // Optimization: Sample data instead of checking every point
+            // Target ~5000 checks max to keep UI responsive
+            const targetChecks = 5000;
+            const step = Math.ceil(currentData.length / targetChecks);
+
+            for (let i = 0; i < currentData.length; i += step) {
+                const d = currentData[i];
+                // d[0] is h3 index. We need lat/lon. 
+                // h3-js v4 renamed h3ToGeo to cellToLatLng
+                const [lat, lon] = h3.cellToLatLng(d[0]);
+
+                // Simple bounding box check is much faster than containsPixel
+                if (lon >= minLon && lon <= maxLon && lat >= minLat && lat <= maxLat) {
+                    if (d[1] > max) max = d[1];
+                    hasVisible = true;
+                }
+            }
+
+            if (!hasVisible) max = globalMaxVal; // Fallback
+            if (max === 0) max = 1;
+
+            viewMaxVal = max;
+            renderLayer(currentData);
+        }
+
+        function loadCountry(code) {
+            const country = countries.find(c => c.code === code);
+            if (!country) return;
+            currentCountry = country;
+
+            // Update Title and Subtitle
+            document.querySelector('h1').innerText = country.name;
+            document.querySelector('.subtitle').innerText =
+                `Visualizing population clusters across ${country.name}. Taller bars indicate higher density within each 400m hexagon.`;
+
+            // Calculate view state from bbox
+            // bbox is [minx, miny, maxx, maxy]
+            const [minLon, minLat, maxLon, maxLat] = country.bbox;
+
+            const viewport = new WebMercatorViewport({
+                width: window.innerWidth,
+                height: window.innerHeight
+            });
+
+            const { longitude, latitude, zoom } = viewport.fitBounds(
+                [[minLon, minLat], [maxLon, maxLat]],
+                { padding: 40 }
+            );
+
+            // Clear existing layer immediately
+            renderLayer([]);
+
+            // Fly to country
+            const TRANSITION_DURATION = 2000;
+
+            // Define fetch logic
+            const fetchData = () => {
+                // Show spinner
+                spinnerContainer.style.display = 'block';
+
+                // Fetch data
+                // Use CSV for smaller file sizes
+                fetch(`public/data/${code}.csv`)
+                    .then(response => {
+                        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                        return response.text();
+                    })
+                    .then(text => {
+                        // Parse CSV: h3_index,population (no header)
+                        const data = [];
+                        if (text) {
+                            const lines = text.split('\n');
+                            for (let i = 0; i < lines.length; i++) {
+                                const line = lines[i].trim();
+                                if (line) {
+                                    const parts = line.split(',');
+                                    if (parts.length === 2) {
+                                        const val = parseFloat(parts[1]);
+                                        if (val > 0) {
+                                            data.push([parts[0], val]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Initial render to set global max
+                        renderLayer(data);
+                        // Then calculate visible max
+                        updateVisibleMax();
+
+                        // Hide loading
+                        spinnerContainer.style.display = 'none';
+                    })
+                    .catch(err => {
+                        console.error("Failed to load data:", err);
+                        spinnerContainer.style.display = 'none';
+                    });
+            };
+
+            deckgl.setProps({
+                initialViewState: {
+                    longitude,
+                    latitude,
+                    zoom,
+                    pitch: 45,
+                    bearing: 0,
+                    transitionDuration: TRANSITION_DURATION,
+                    transitionInterpolator: new FlyToInterpolator(),
+                    onTransitionEnd: () => {
+                        console.log('Transition complete, loading data...');
+                        fetchData();
+                        // Reset callback to avoid firing on other transitions
+                        deckgl.setProps({ onTransitionEnd: null });
+                    }
+                }
+            });
+
+
+
+
+        }
+        function renderLayer(data) {
+            // If data changed, update global max
+            if (data !== currentData) {
+                currentData = data;
+                let max = 0;
+                for (let i = 0; i < data.length; i++) {
+                    if (data[i][1] > max) max = data[i][1];
+                }
+                globalMaxVal = max || 1;
+                // Initial view max is global max until zoomed
+                viewMaxVal = globalMaxVal;
+            }
+
+            const layer = new H3HexagonLayer({
+                id: 'h3-hexagon-layer',
+                data: data,
+                pickable: true,
+                wireframe: false,
+                filled: true,
+                extruded: true,
+                castShadow: useShadows,
+                material: {
+                    ambient: 0.2,
+                    diffuse: 0.8,
+                    shininess: 32,
+                    specularColor: [50, 50, 50]
+                },
+                getHexagon: d => d[0],
+                getElevation: d => d[1] / globalMaxVal, // Height stays relative to global max to preserve physical scale
+                getFillColor: d => {
+                    const val = d[1];
+                    // Use viewMaxVal for color normalization
+                    // Re-apply square root scale to make gradient visible on skewed data
+                    const ratio = Math.sqrt(Math.min(val / viewMaxVal, 1));
+
+                    // Multi-stop gradient interpolation
+                    const colors = currentColors;
+                    const colorCount = colors.length;
+
+                    if (colorCount === 1) return colors[0];
+
+                    const segmentSize = 1 / (colorCount - 1);
+                    const segmentIndex = Math.min(Math.floor(ratio / segmentSize), colorCount - 2);
+                    const segmentRatio = (ratio - (segmentIndex * segmentSize)) / segmentSize;
+
+                    const start = colors[segmentIndex];
+                    const end = colors[segmentIndex + 1];
+
+                    const r = Math.round(start[0] + (end[0] - start[0]) * segmentRatio);
+                    const g = Math.round(start[1] + (end[1] - start[1]) * segmentRatio);
+                    const b = Math.round(start[2] + (end[2] - start[2]) * segmentRatio);
+
+                    return [r, g, b, 255];
+                },
+                elevationScale: parseFloat(heightSlider.value),
+                onHover: ({ object, x, y }) => {
+                    const el = document.getElementById('tooltip');
+                    if (object) {
+                        el.innerHTML = `Population: ${object[1].toFixed(1)}`;
+                        el.style.display = 'block';
+                        el.style.left = x + 'px';
+                        el.style.top = y + 'px';
+                    } else {
+                        el.style.display = 'none';
+                    }
+                },
+                parameters: {
+                    depthTest: true,
+                    cull: true
+                },
+                updateTriggers: {
+                    getFillColor: [currentColors, viewMaxVal]
+                }
+            });
+
+            const layers = [layer];
+
+            if (useShadows) {
+                let groundPolygon = [
+                    [-180, 90],
+                    [180, 90],
+                    [180, -90],
+                    [-180, -90]
+                ];
+
+                if (currentCountry && currentCountry.bbox) {
+                    const [minLon, minLat, maxLon, maxLat] = currentCountry.bbox;
+                    // Add padding to ensure it covers the view
+                    const p = 2.0;
+                    groundPolygon = [
+                        [minLon - p, maxLat + p],
+                        [maxLon + p, maxLat + p],
+                        [maxLon + p, minLat - p],
+                        [minLon - p, minLat - p]
+                    ];
+                }
+
+                const groundLayer = new PolygonLayer({
+                    id: 'ground-plane',
+                    data: [groundPolygon],
+                    stroked: false,
+                    filled: true,
+                    getPolygon: d => d,
+                    getFillColor: [255, 255, 255, 20], // Transparent white
+                    material: {
+                        ambient: 0.2,
+                        diffuse: 0.5,
+                        shininess: 32,
+                        specularColor: [50, 50, 50]
+                    }
+                });
+                layers.unshift(groundLayer); // Add to bottom
+            }
+
+            console.log('Rendering layers:', layers.length, 'useShadows:', useShadows);
+
+            deckgl.setProps({
+                layers: layers
+            });
+        }
+    </script>
+</body>
+
+</html>
