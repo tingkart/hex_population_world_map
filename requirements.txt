@@ -1,0 +1,10 @@
+# Core data processing
+pandas>=2.0.0
+h3>=4.0.0
+
+# Geospatial operations
+shapely>=2.0.0
+geopandas>=0.14.0
+
+# Optional: for faster operations
+pyarrow>=14.0.0
